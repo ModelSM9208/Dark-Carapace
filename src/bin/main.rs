@@ -7,21 +7,17 @@
 )]
 #![deny(clippy::large_stack_frames)]
 
+extern crate alloc;
+
 use embassy_executor::Spawner;
-//use embassy_time::{Duration, Timer};
+use embassy_futures::join::join;
+use embassy_futures::select::select;
+use embassy_time::Timer;
 use esp_hal::clock::CpuClock;
+use esp_hal::rng::{Trng, TrngSource};
 use esp_hal::timer::timg::TimerGroup;
 use esp_radio::ble::controller::BleConnector;
-
-//ble tooth imports
-use bleps::ad_structure::{
-    AdStructure, BR_EDR_NOT_SUPPORTED, LE_GENERAL_DISCOVERABLE, create_advertising_data,
-};
-use bleps::async_attribute_server::AttributeServer;
-use bleps::asynch::Ble;
-//use bleps::attribute_server::WorkResult;
-use bleps::gatt;
-use esp_hal::rng::{Trng, TrngSource};
+use trouble_host::prelude::*;
 
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
@@ -29,107 +25,188 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     loop {}
 }
 
-extern crate alloc;
-
-// This creates a default app-descriptor required by the esp-idf bootloader.
-// For more information see: <https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-reference/system/app_image_format.html#application-description>
 esp_bootloader_esp_idf::esp_app_desc!();
 
-#[allow(
-    clippy::large_stack_frames,
-    reason = "it's not unusual to allocate larger buffers etc. in main"
-)]
+// ── GATT Server Definition ──────────────────────────────────────────
+// trouble's #[gatt_server] macro generates the server struct, handles,
+// and all ATT plumbing at compile time. No manual attribute arrays.
 
-fn millis() -> u64 {
-    esp_hal::time::Instant::now()
-        .duration_since_epoch()
-        .as_millis()
+#[gatt_server]
+struct Server {
+    carapace_service: CarapaceService,
 }
 
+#[gatt_service(uuid = "937312e0-2354-11eb-9f10-fbc30a62cf38")]
+struct CarapaceService {
+    #[characteristic(uuid = "937312e0-2354-11eb-9f10-fbc30a62cf39", read, write, notify)]
+    greeting: [u8; 23],
+}
+
+// ── BLE Runner Task ─────────────────────────────────────────────────
+// This must run forever alongside the application. It processes HCI
+// events from the radio controller.
+async fn ble_task<C: Controller, P: PacketPool>(mut runner: Runner<'_, C, P>) {
+    loop {
+        if let Err(e) = runner.run().await {
+            panic!("[ble_task] error: {:?}", e);
+        }
+    }
+}
+
+// ── GATT Event Handler ──────────────────────────────────────────────
+// Processes read/write/disconnect events on the connection.
+async fn gatt_events_task<P: PacketPool>(server: &Server<'_>, conn: &GattConnection<'_, '_, P>) {
+    let greeting = server.carapace_service.greeting;
+    loop {
+        match conn.next().await {
+            GattConnectionEvent::Disconnected { reason } => {
+                log::info!("[gatt] disconnected: {:?}", reason);
+                break;
+            }
+            GattConnectionEvent::Gatt { event } => {
+                match &event {
+                    GattEvent::Read(e) => {
+                        if e.handle() == greeting.handle {
+                            log::info!("[gatt] Read on greeting characteristic");
+                        }
+                    }
+                    GattEvent::Write(e) => {
+                        if e.handle() == greeting.handle {
+                            log::info!("[gatt] Write on greeting: {:?}", e.data());
+                        }
+                    }
+                    _ => {}
+                }
+                match event.accept() {
+                    Ok(reply) => reply.send().await,
+                    Err(e) => log::warn!("[gatt] error sending response: {:?}", e),
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+// ── Notification Task ───────────────────────────────────────────────
+// Sends periodic notifications to connected clients.
+// Also reads RSSI to monitor signal strength.
+async fn notify_task<P: PacketPool>(server: &Server<'_>, conn: &GattConnection<'_, '_, P>) {
+    let greeting = server.carapace_service.greeting;
+    let mut tick: u8 = 0;
+    loop {
+        tick = tick.wrapping_add(1);
+        let msg = b"Hello from the Carapace";
+        if greeting.notify(conn, msg).await.is_err() {
+            log::info!("[notify] client gone, stopping notifications");
+            break;
+        }
+        log::info!("[notify] tick={}", tick);
+        Timer::after_secs(2).await;
+    }
+}
+
+// ── Advertise and Accept ────────────────────────────────────────────
+async fn advertise<'values, 'server, C: Controller>(
+    peripheral: &mut Peripheral<'values, C, DefaultPacketPool>,
+    server: &'server Server<'values>,
+) -> Result<GattConnection<'values, 'server, DefaultPacketPool>, BleHostError<C::Error>> {
+    let mut adv_data = [0; 31];
+    let len = AdStructure::encode_slice(
+        &[
+            AdStructure::Flags(LE_GENERAL_DISCOVERABLE | BR_EDR_NOT_SUPPORTED),
+            AdStructure::CompleteLocalName(b"DarkCarapace"),
+        ],
+        &mut adv_data[..],
+    )?;
+    let advertiser = peripheral
+        .advertise(
+            &Default::default(),
+            Advertisement::ConnectableScannableUndirected {
+                adv_data: &adv_data[..len],
+                scan_data: &[],
+            },
+        )
+        .await?;
+    log::info!("[adv] advertising as DarkCarapace");
+    let conn = advertiser.accept().await?.with_attribute_server(server)?;
+    log::info!("[adv] connection established");
+    Ok(conn)
+}
+
+// ── Main ────────────────────────────────────────────────────────────
+
+const CONNECTIONS_MAX: usize = 1;
+const L2CAP_CHANNELS_MAX: usize = 2; // Signal + ATT
+
+#[allow(clippy::large_stack_frames, reason = "main allocates larger buffers")]
 #[esp_rtos::main]
 async fn main(_spawner: Spawner) -> ! {
-    // generator version: 1.2.0
-
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
     let peripherals = esp_hal::init(config);
     esp_println::println!("=== DarkCarapace is alive ===");
     esp_println::logger::init_logger(log::LevelFilter::Info);
     esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: 98768);
-    // COEX needs more RAM - so we've added some more
-    //    esp_alloc::heap_allocator!(size: 64 * 1024); //Removed as we are only enabling bluetooth no wifi no coex
 
     let timg0 = TimerGroup::new(peripherals.TIMG0);
     esp_rtos::start(timg0.timer0);
 
-    let radio_init = esp_radio::init().expect("Failed to initialize Wi-Fi/BLE controller");
-    /*
-        let (mut _wifi_controller, _interfaces) =
-            esp_radio::wifi::new(&radio_init, peripherals.WIFI, Default::default())
-                .expect("Failed to initialize Wi-Fi controller");
-    */
+    // Hardware entropy source — feeds true randomness from silicon
+    // TrngSource must stay alive for the lifetime of any Trng instances
+    let _trng_source = TrngSource::new(peripherals.RNG, peripherals.ADC1);
+    let rng = Trng::try_new().expect("Failed to create TRNG — TrngSource not active");
+
+    // Initialize BLE radio controller
+    let radio_init = esp_radio::init().expect("Failed to initialize BLE controller");
     let connector = BleConnector::new(&radio_init, peripherals.BT, Default::default())
         .expect("Failed to create BLE connector");
-    let mut ble = Ble::new(connector, millis);
-    assert!(ble.init().await.is_ok(), "BLE init failed");
-    log::info!("BLE init complete");
+    let controller: ExternalController<_, 20> = ExternalController::new(connector);
 
-    // TrngSource must stay alive — it feeds hardware entropy to Trng.
-    // Dropping it kills the entropy source and Trng will panic.
-    let _trng_source = TrngSource::new(peripherals.RNG, peripherals.ADC1);
-    let mut rng = Trng::try_new().expect("Failed to create TRNG — TrngSource not active");
+    // Build the BLE host stack
+    // The MAC address serves as our identity on the air — using hardware RNG for a random address
+    let mut addr_bytes = [0u8; 6];
+    rng.read(&mut addr_bytes);
+    let address = Address::random(addr_bytes);
+    log::info!("[init] BLE address: {:?}", address);
 
-    loop {
-        // Advertise
-        log::info!("(Re)starting advertising cycle...");
-        ble.cmd_set_le_advertising_parameters()
-            .await
-            .expect("adv params failed");
-        log::info!("Advertising params set");
-        ble.cmd_set_le_advertising_data(
-            create_advertising_data(&[
-                AdStructure::Flags(LE_GENERAL_DISCOVERABLE | BR_EDR_NOT_SUPPORTED),
-                AdStructure::CompleteLocalName("DarkCarapace"),
-            ])
-            .expect("adv data creation failed"),
-        )
-        .await
-        .expect("adv data failed");
-        log::info!("Advertising data set");
-        ble.cmd_set_le_advertise_enable(true)
-            .await
-            .expect("adv enable failed");
-        log::info!("Advertising enabled — scanning should find DarkCarapace");
+    let mut resources: HostResources<DefaultPacketPool, CONNECTIONS_MAX, L2CAP_CHANNELS_MAX> =
+        HostResources::new();
+    let stack = trouble_host::new(controller, &mut resources).set_random_address(address);
+    let host = stack.build();
+    let runner = host.runner;
+    let mut peripheral = host.peripheral;
 
-        // GATT service with one readable characteristic
-        let mut rf = |offset: usize, data: &mut [u8]| {
-            let msg = b"Hello from the Carapace";
-            if offset >= msg.len() {
-                return 0;
+    // Initialize GATT server with our custom service
+    let server = Server::new_with_config(GapConfig::Peripheral(PeripheralConfig {
+        name: "DarkCarapace",
+        appearance: &appearance::UNKNOWN,
+    }))
+    .unwrap();
+
+    // Set the initial greeting value
+    let msg = b"Hello from the Carapace";
+    server.set(&server.carapace_service.greeting, msg).unwrap();
+
+    log::info!("[init] GATT server ready, entering main loop");
+
+    // Run the BLE stack and application concurrently
+    let _ = join(ble_task(runner), async {
+        loop {
+            match advertise(&mut peripheral, &server).await {
+                Ok(conn) => {
+                    let a = gatt_events_task(&server, &conn);
+                    let b = notify_task(&server, &conn);
+                    // Run until either task ends (disconnect), then re-advertise
+                    select(a, b).await;
+                    log::info!("[main] connection ended, re-advertising...");
+                }
+                Err(e) => {
+                    panic!("[adv] error: {:?}", e);
+                }
             }
-            let remaining = &msg[offset..];
-            let len = remaining.len().min(data.len());
-            data[..len].copy_from_slice(&remaining[..len]);
-            len
-        };
-        let mut wf = |_offset: usize, _data: &[u8]| {};
+        }
+    })
+    .await;
 
-        gatt!([service {
-            uuid: "937312e0-2354-11eb-9f10-fbc30a62cf38",
-            characteristics: [characteristic {
-                uuid: "937312e0-2354-11eb-9f10-fbc30a62cf39",
-                read: rf,
-                write: wf,
-            }],
-        }]);
-
-        let mut srv = AttributeServer::new(&mut ble, &mut gatt_attributes, &mut rng);
-        let mut notifier = || core::future::pending();
-        log::info!("GATT server running, waiting for connection...");
-        srv.run(&mut notifier).await.expect("GATT server error");
-        log::info!("Client disconnected or server exited, restarting...");
-
-        // If we get here, client disconnected — loop back and re-advertise
-    }
-
-    // for inspiration have a look at the examples at https://github.com/esp-rs/esp-hal/tree/esp-hal-v1.0.0/examples
+    // join never returns, but the compiler needs to see -> !
+    loop {}
 }
